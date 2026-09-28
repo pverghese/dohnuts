@@ -85,6 +85,10 @@ def load_mmlu_records(smoke_test: bool = False):
         calib_rows = list(val_source)
         test_rows = list(test_source)
 
+    def to_criteria(choices):
+        letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
+        return {letters[k]: str(c) for k, c in enumerate(choices)}
+
     for i, r in enumerate(train_rows):
         subject = r.get("subject", "general")
         records.append(
@@ -97,7 +101,7 @@ def load_mmlu_records(smoke_test: bool = False):
                 question={
                     "type": "choice",
                     "instructions": r["question"],
-                    "criteria": r["choices"],
+                    "criteria": to_criteria(r["choices"]),
                 },
                 target=r["answer"],
             )
@@ -115,7 +119,7 @@ def load_mmlu_records(smoke_test: bool = False):
                 question={
                     "type": "choice",
                     "instructions": r["question"],
-                    "criteria": r["choices"],
+                    "criteria": to_criteria(r["choices"]),
                 },
                 target=r["answer"],
             )
@@ -133,7 +137,7 @@ def load_mmlu_records(smoke_test: bool = False):
                 question={
                     "type": "choice",
                     "instructions": r["question"],
-                    "criteria": r["choices"],
+                    "criteria": to_criteria(r["choices"]),
                 },
                 target=r["answer"],
             )
@@ -151,7 +155,7 @@ def load_mmlu_records(smoke_test: bool = False):
                 question={
                     "type": "choice",
                     "instructions": r["question"],
-                    "criteria": r["choices"],
+                    "criteria": to_criteria(r["choices"]),
                 },
                 target=r["answer"],
             )

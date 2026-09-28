@@ -37,7 +37,11 @@ def options_for(question):
     elif kind == "choice":
         if isinstance(criteria, list):
             labels = [str(value) for value in criteria]
-            options = [render(value) for value in criteria]
+            if len(set(labels)) != len(labels):
+                labels = [f"{chr(65 + i)}: {v}" for i, v in enumerate(criteria)]
+                options = [f"{chr(65 + i)}: {render(v)}" for i, v in enumerate(criteria)]
+            else:
+                options = [render(value) for value in criteria]
         elif isinstance(criteria, Mapping):
             labels = list(criteria)
             options = [
