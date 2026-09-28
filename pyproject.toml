@@ -11,16 +11,16 @@ license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.12"
 dependencies = [
-  "torch>=2.9",
-  "torchvision>=0.24",
+  "torch>=2.4",
+  "torchvision>=0.19",
   "transformers>=5.17,<5.18",
   "peft>=0.21,<0.22",
   "Pillow>=11",
   "huggingface-hub>=1.0,<2",
-  "flash-linear-attention[rocm]==0.5.2",
 ]
 
 [project.optional-dependencies]
+gpu = ["flash-linear-attention>=0.5.2"]
 train = ["pyarrow>=25", "scikit-learn>=1.9", "pandas>=3.0", "datasets>=4"]
 agent = ["bub @ git+https://github.com/bubbuild/bub.git@9bf70488e22a44eeb875a9d55d9a7d352b82e381"]
 
