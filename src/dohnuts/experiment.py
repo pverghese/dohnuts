@@ -176,7 +176,7 @@ def environment(model: DecisionModel, checkpoint: Path):
         "dtype": str(next(model.backbone.parameters()).dtype),
         "kernel_flags": {
             "linear_patch": True,
-            "triton_convolution": bool(torch.version.hip),
+            "triton_convolution": torch.cuda.is_available(),
             "fused_norm_and_swiglu": torch.cuda.is_available(),
             "shared_prefix": True,
             "frozen_vision_cache_MiB": 128,
