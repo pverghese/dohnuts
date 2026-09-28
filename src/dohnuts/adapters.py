@@ -38,7 +38,7 @@ class Qwen35Adapter:
             torch.cuda.set_per_process_memory_fraction(0.8)
             if torch.version.hip:
                 os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
-                enable_triton_convolution()
+            enable_triton_convolution()
         dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         backbone = AutoModel.from_pretrained(
             checkpoint, dtype=dtype, attn_implementation="sdpa", local_files_only=True
