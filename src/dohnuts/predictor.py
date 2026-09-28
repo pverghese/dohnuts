@@ -169,7 +169,11 @@ class Predictor:
         inputs, positions, mask, metadata = self.prepare(state, questions)
         token_count = int(inputs["attention_mask"].sum())
         has_image = "pixel_values" in inputs
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
         inputs = {
             key: value.to(device) if isinstance(value, torch.Tensor) else value
             for key, value in inputs.items()

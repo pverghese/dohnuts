@@ -79,8 +79,8 @@ def load_mmlu_records(smoke_test: bool = False):
         calib_rows = list(val_source.select(range(min(50, len(val_source)))))
         test_rows = list(test_source.select(range(min(200, len(test_source)))))
     else:
-        # Full or balanced: take balanced subset or full
-        train_rows = list(train_source.select(range(min(5000, len(train_source)))))
+        # Full MMLU: use all auxiliary_train rows for comprehensive training
+        train_rows = list(train_source)
         dev_rows = list(dev_source)
         calib_rows = list(val_source)
         test_rows = list(test_source)
