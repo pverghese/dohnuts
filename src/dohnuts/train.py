@@ -1,6 +1,7 @@
 """Resumable mixed-dataset RLCD with development-only checkpoint selection."""
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -153,7 +154,8 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
     if is_distributed:
         torch.distributed.barrier()
 
-    torch.set_num_threads(config["cpu_threads"])
+    threads = max(1, config["cpu_threads"] // world_size)
+    torch.set_num_threads(threads)
     torch.manual_seed(config["seed"])
     random.seed(config["seed"])
     policy = RLCDConfig(**config.get("rlcd", {}))
@@ -171,7 +173,9 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
             model,
             device_ids=[local_rank] if torch.cuda.is_available() else None,
             output_device=local_rank if torch.cuda.is_available() else None,
+            broadcast_buffers=False,
             find_unused_parameters=False,
+            gradient_as_bucket_view=True,
         )
     else:
         train_model = model
@@ -303,11 +307,12 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
         rank=rank,
         world_size=world_size,
     )
+    num_workers = max(1, config["workers"] // world_size) if config["workers"] else 0
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=None,
-        num_workers=config["workers"],
-        prefetch_factor=2 if config["workers"] else None,
+        num_workers=num_workers,
+        prefetch_factor=2 if num_workers else None,
         pin_memory=True,
     )
     iterator = prefetch_batches(loader)
@@ -346,10 +351,16 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
             for _micro in range(dataset.local_accumulation):
                 batch, key, ids = next(iterator)
                 inputs, positions, mask, target, ordinal = batch
-                logits = train_model(inputs, positions)
-                loss, metrics = rlcd_loss(logits, target, mask=mask, ordinal=ordinal, config=policy)
-                finite &= torch.isfinite(loss.detach())
-                (loss / dataset.local_accumulation).backward()
+                sync_context = (
+                    train_model.no_sync()
+                    if is_distributed and _micro < dataset.local_accumulation - 1
+                    else contextlib.nullcontext()
+                )
+                with sync_context:
+                    logits = train_model(inputs, positions)
+                    loss, metrics = rlcd_loss(logits, target, mask=mask, ordinal=ordinal, config=policy)
+                    finite &= torch.isfinite(loss.detach())
+                    (loss / dataset.local_accumulation).backward()
                 stats.update({k: v.detach() / dataset.local_accumulation for k, v in metrics.items()})
                 stats["loss"] += loss.detach() / dataset.local_accumulation
                 stats["accuracy"] += (
