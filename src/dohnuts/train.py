@@ -138,7 +138,8 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
         torch.distributed.init_process_group(
-            backend="nccl" if torch.cuda.is_available() else "gloo"
+            backend="nccl" if torch.cuda.is_available() else "gloo",
+            device_id=torch.device("cuda", local_rank) if torch.cuda.is_available() else None,
         )
 
     device = (
@@ -215,11 +216,11 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
         frozen["adapter"] = model.adapter.name
         frozen["base_model"] = model.adapter.base_model
     config_path = run / "config.json"
+    previous = json.loads(config_path.read_text()) if config_path.exists() else None
+    frozen["lr_decay_steps"] = (
+        previous["lr_decay_steps"] if previous else min(config["steps"], LR_DECAY_STEPS)
+    )
     if rank == 0:
-        previous = json.loads(config_path.read_text()) if config_path.exists() else None
-        frozen["lr_decay_steps"] = (
-            previous["lr_decay_steps"] if previous else min(config["steps"], LR_DECAY_STEPS)
-        )
         if previous is not None:
             expected = {
                 **previous,
