@@ -85,7 +85,11 @@ class DecisionCollator:
 
 
 def to_gpu(batch):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
     non_blocking = torch.cuda.is_available()
     inputs, positions, mask, target, ordinal = batch
     inputs = {
@@ -167,18 +171,36 @@ class EvaluationBatches(torch.utils.data.Dataset):
 class TrainingBatches(torch.utils.data.Dataset):
     """Index determines the exact examples and permutations, including after resume."""
 
-    def __init__(self, groups, collator, *, seed, batch_size, steps, accumulation, start_step=0):
+    def __init__(
+        self,
+        groups,
+        collator,
+        *,
+        seed,
+        batch_size,
+        steps,
+        accumulation,
+        start_step=0,
+        rank=0,
+        world_size=1,
+    ):
         self.groups, self.collator = groups, collator
         self.keys = sorted(groups)
         self.seed, self.batch_size = seed, batch_size
         self.steps, self.accumulation, self.start_step = steps, accumulation, start_step
+        self.rank, self.world_size = rank, max(1, world_size)
+        self.local_accumulation = max(1, accumulation // self.world_size)
 
     def __len__(self):
-        return (self.steps - self.start_step) * self.accumulation
+        return (self.steps - self.start_step) * self.local_accumulation
 
     def __getitem__(self, index):
-        index += self.start_step * self.accumulation
-        rng = random.Random(self.seed * 1000000007 + index)
+        step_offset = index // self.local_accumulation
+        micro_offset = index % self.local_accumulation
+        actual_step = self.start_step + step_offset
+        # Map deterministically: distribute microbatches across world_size workers
+        sample_index = actual_step * self.accumulation + (micro_offset * self.world_size + self.rank)
+        rng = random.Random(self.seed * 1000000007 + sample_index)
         key = self.keys[rng.randrange(len(self.keys))]
         rows = [rng.choice(self.groups[key]) for _ in range(self.batch_size)]
         return (

@@ -29,7 +29,11 @@ class DecisionModel(nn.Module):
         self.base_path = Path(checkpoint)
         self.processor = self.adapter.processor(checkpoint)
         self.backbone = self.adapter.load(checkpoint)
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
         self.head = nn.Linear(
             self.adapter.hidden_size(self.backbone),
             1,

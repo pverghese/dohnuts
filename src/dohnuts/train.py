@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import random
 import time
 from collections import Counter, deque
@@ -128,7 +129,29 @@ def evaluate(model, groups, collator, output, batch_size=16):
 
 
 def train(config, run, *, resume=False, adapter=None, initialize_from=None):
-    run.mkdir(parents=True, exist_ok=True)
+    is_distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+    if is_distributed:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        torch.distributed.init_process_group(
+            backend="nccl" if torch.cuda.is_available() else "gloo"
+        )
+
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
+
+    if rank == 0:
+        run.mkdir(parents=True, exist_ok=True)
+    if is_distributed:
+        torch.distributed.barrier()
+
     torch.set_num_threads(config["cpu_threads"])
     torch.manual_seed(config["seed"])
     random.seed(config["seed"])
@@ -139,7 +162,20 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
     if initialize_from is not None:
         metadata = model.load_adapter(initialize_from)
         parent = {"checkpoint": str(initialize_from), "weights_sha256": metadata["weights_sha256"]}
-    parameters = [p for p in model.parameters() if p.requires_grad]
+
+    if is_distributed:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+
+        train_model = DDP(
+            model,
+            device_ids=[local_rank] if torch.cuda.is_available() else None,
+            output_device=local_rank if torch.cuda.is_available() else None,
+            find_unused_parameters=False,
+        )
+    else:
+        train_model = model
+
+    parameters = [p for p in train_model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
         [
             {
@@ -179,21 +215,25 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
         frozen["adapter"] = model.adapter.name
         frozen["base_model"] = model.adapter.base_model
     config_path = run / "config.json"
-    previous = json.loads(config_path.read_text()) if config_path.exists() else None
-    frozen["lr_decay_steps"] = (
-        previous["lr_decay_steps"] if previous else min(config["steps"], LR_DECAY_STEPS)
-    )
-    if previous is not None:
-        expected = {
-            **previous,
-            "lr_decay_steps": frozen["lr_decay_steps"],
-            "steps": config["steps"],
-        }
-        if not resume or expected != frozen or config["steps"] < previous["steps"]:
-            raise ValueError("Resume may only extend the step budget of the same recipe and data")
-    temporary = config_path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(frozen, indent=2) + "\n")
-    temporary.replace(config_path)
+    if rank == 0:
+        previous = json.loads(config_path.read_text()) if config_path.exists() else None
+        frozen["lr_decay_steps"] = (
+            previous["lr_decay_steps"] if previous else min(config["steps"], LR_DECAY_STEPS)
+        )
+        if previous is not None:
+            expected = {
+                **previous,
+                "lr_decay_steps": frozen["lr_decay_steps"],
+                "steps": config["steps"],
+            }
+            if not resume or expected != frozen or config["steps"] < previous["steps"]:
+                raise ValueError("Resume may only extend the step budget of the same recipe and data")
+        temporary = config_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(frozen, indent=2) + "\n")
+        temporary.replace(config_path)
+    if is_distributed:
+        torch.distributed.barrier()
+
     collator = DecisionCollator(config["model"], adapter=adapter)
     step = 0
     best = -1.0
@@ -201,51 +241,56 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
         state = load_checkpoint(model, run / "last.pt", optimizer)
         step = state["step"]
         best = state["dev_macro_accuracy"]
-        # Only saved updates belong to the resumed trajectory. A stopped process
-        # may have logged later steps before its next checkpoint was committed.
-        metrics_path = run / "metrics.jsonl"
-        committed = [
-            line
-            for line in metrics_path.read_text().splitlines()
-            if json.loads(line).get("step", 0) <= step
-            and json.loads(line).get("kind") != "train_complete"
-        ]
-        temporary = metrics_path.with_suffix(".tmp")
-        temporary.write_text("\n".join(committed) + "\n")
-        temporary.replace(metrics_path)
-        emit(
-            metrics_path,
-            {
-                "kind": "resume",
-                "step": step,
-                "target_step": config["steps"],
-                "lr_decay_steps": frozen["lr_decay_steps"],
-                "optimizer_lr": [group["lr"] for group in optimizer.param_groups],
-                "checkpoint_sha256": file_hash(run / "last.pt"),
-            },
-        )
-    else:
-        if (run / "metrics.jsonl").exists():
-            raise ValueError("Existing run requires --resume")
-        emit(run / "metrics.jsonl", environment(model, Path(config["model"])))
-        (run / "samples.json").write_text(
-            json.dumps(
+        if rank == 0:
+            # Only saved updates belong to the resumed trajectory. A stopped process
+            # may have logged later steps before its next checkpoint was committed.
+            metrics_path = run / "metrics.jsonl"
+            committed = [
+                line
+                for line in metrics_path.read_text().splitlines()
+                if json.loads(line).get("step", 0) <= step
+                and json.loads(line).get("kind") != "train_complete"
+            ]
+            temporary = metrics_path.with_suffix(".tmp")
+            temporary.write_text("\n".join(committed) + "\n")
+            temporary.replace(metrics_path)
+            emit(
+                metrics_path,
                 {
-                    "train": {k: [r["id"] for r in v] for k, v in groups.items()},
-                    "dev": {k: [r["id"] for r in v] for k, v in dev.items()},
+                    "kind": "resume",
+                    "step": step,
+                    "target_step": config["steps"],
+                    "lr_decay_steps": frozen["lr_decay_steps"],
+                    "optimizer_lr": [group["lr"] for group in optimizer.param_groups],
+                    "checkpoint_sha256": file_hash(run / "last.pt"),
                 },
-                indent=2,
             )
-        )
-        baseline = evaluate(
-            model, dev, collator, run / "dev-step-000000.jsonl", config["eval_batch_size"]
-        )
-        baseline_metrics = by_dataset(baseline)
-        emit(run / "metrics.jsonl", {"kind": "dev", "step": 0, "metrics": baseline_metrics})
-        best = baseline_metrics["macro_accuracy"]
-        # Continuing from a good checkpoint may never improve development quality.
-        # In that case the untouched parent remains the selected candidate.
-        save_checkpoint(run / "best.pt", model, optimizer, 0, frozen, best)
+    else:
+        if rank == 0:
+            if (run / "metrics.jsonl").exists():
+                raise ValueError("Existing run requires --resume")
+            emit(run / "metrics.jsonl", environment(model, Path(config["model"])))
+            (run / "samples.json").write_text(
+                json.dumps(
+                    {
+                        "train": {k: [r["id"] for r in v] for k, v in groups.items()},
+                        "dev": {k: [r["id"] for r in v] for k, v in dev.items()},
+                    },
+                    indent=2,
+                )
+            )
+            baseline = evaluate(
+                model, dev, collator, run / "dev-step-000000.jsonl", config["eval_batch_size"]
+            )
+            baseline_metrics = by_dataset(baseline)
+            emit(run / "metrics.jsonl", {"kind": "dev", "step": 0, "metrics": baseline_metrics})
+            best = baseline_metrics["macro_accuracy"]
+            # Continuing from a good checkpoint may never improve development quality.
+            # In that case the untouched parent remains the selected candidate.
+            save_checkpoint(run / "best.pt", model, optimizer, 0, frozen, best)
+        if is_distributed:
+            torch.distributed.barrier()
+
     dataset = TrainingBatches(
         groups,
         collator,
@@ -254,6 +299,8 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
         steps=config["steps"],
         accumulation=config["accumulation"],
         start_step=step,
+        rank=rank,
+        world_size=world_size,
     )
     loader = torch.utils.data.DataLoader(
         dataset,
@@ -266,7 +313,7 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
     start_time = time.perf_counter()
     consumed = Counter()
     elapsed_before_resume = 0.0
-    if resume:
+    if resume and rank == 0:
         # Restore plotting counters from the last logged step at/before the
         # checkpoint; optimizer/RNG and actual data order were restored above.
         for line in (run / "metrics.jsonl").read_text().splitlines():
@@ -274,11 +321,13 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
             if previous.get("kind") == "train" and previous["step"] <= step:
                 consumed = Counter(previous["consumed"])
                 elapsed_before_resume = previous["elapsed_s"]
+
+    telemetry_path = run / "resources.jsonl" if rank == 0 else None
     with Sampler(
-        Path("/sys/class/drm/card1/device"), interval=1.0, output=run / "resources.jsonl"
+        Path("/sys/class/drm/card1/device"), interval=1.0, output=telemetry_path
     ) as telemetry:
         while step < config["steps"]:
-            model.train()
+            train_model.train()
             optimizer.zero_grad(set_to_none=True)
             decay_steps = frozen["lr_decay_steps"]
             warmup = max(1, int(decay_steps * 0.03))
@@ -291,20 +340,20 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
             for group in optimizer.param_groups:
                 group["lr"] = group["initial_lr"] * factor
             stats = Counter()
-            finite = torch.ones((), dtype=torch.bool, device="cuda" if torch.cuda.is_available() else "cpu")
+            finite = torch.ones((), dtype=torch.bool, device=device)
             step_start = time.perf_counter()
-            for _micro in range(config["accumulation"]):
+            for _micro in range(dataset.local_accumulation):
                 batch, key, ids = next(iterator)
                 inputs, positions, mask, target, ordinal = batch
-                logits = model(inputs, positions)
+                logits = train_model(inputs, positions)
                 loss, metrics = rlcd_loss(logits, target, mask=mask, ordinal=ordinal, config=policy)
                 finite &= torch.isfinite(loss.detach())
-                (loss / config["accumulation"]).backward()
-                stats.update({k: v.detach() / config["accumulation"] for k, v in metrics.items()})
-                stats["loss"] += loss.detach() / config["accumulation"]
+                (loss / dataset.local_accumulation).backward()
+                stats.update({k: v.detach() / dataset.local_accumulation for k, v in metrics.items()})
+                stats["loss"] += loss.detach() / dataset.local_accumulation
                 stats["accuracy"] += (
                     logits.detach().masked_fill(~mask, -torch.inf).argmax(-1) == target.argmax(-1)
-                ).float().mean() / config["accumulation"]
+                ).float().mean() / dataset.local_accumulation
                 consumed[key] += len(ids)
             if not finite:
                 raise RuntimeError(f"Non-finite loss at step {step}; optimizer was not advanced")
@@ -314,49 +363,61 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
             if step == 1 or step % config["log_every"] == 0:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
-                # Counter's stub assumes int values; these accumulators contain tensors.
-                totals = cast(list[torch.Tensor], list(stats.values()))
-                emit(
-                    run / "metrics.jsonl",
-                    {
-                        "kind": "train",
-                        "step": step,
-                        "elapsed_s": elapsed_before_resume + time.perf_counter() - start_time,
-                        "step_s": time.perf_counter() - step_start,
-                        **dict(zip(stats, torch.stack(totals).cpu().tolist())),
-                        "grad_norm": float(grad_norm),
-                        "lr": optimizer.param_groups[0]["lr"],
-                        "consumed": dict(consumed),
-                        "memory": memory(),
-                    },
-                )
+                if rank == 0:
+                    # Counter's stub assumes int values; these accumulators contain tensors.
+                    totals = cast(list[torch.Tensor], list(stats.values()))
+                    global_consumed = {k: v * world_size for k, v in consumed.items()}
+                    emit(
+                        run / "metrics.jsonl",
+                        {
+                            "kind": "train",
+                            "step": step,
+                            "elapsed_s": elapsed_before_resume + time.perf_counter() - start_time,
+                            "step_s": time.perf_counter() - step_start,
+                            **dict(zip(stats, torch.stack(totals).cpu().tolist())),
+                            "grad_norm": float(grad_norm),
+                            "lr": optimizer.param_groups[0]["lr"],
+                            "consumed": global_consumed,
+                            "memory": memory(),
+                        },
+                    )
             if step % config["eval_every"] == 0 or step == config["steps"]:
-                predictions = evaluate(
-                    model,
-                    dev,
-                    collator,
-                    run / f"dev-step-{step:06d}.jsonl",
-                    config["eval_batch_size"],
-                )
-                metrics = by_dataset(predictions)
-                score = metrics["macro_accuracy"]
-                emit(run / "metrics.jsonl", {"kind": "dev", "step": step, "metrics": metrics})
-                if score > best:
-                    best = score
-                    save_checkpoint(run / "best.pt", model, optimizer, step, frozen, best)
-                save_checkpoint(run / "last.pt", model, optimizer, step, frozen, best)
+                if rank == 0:
+                    predictions = evaluate(
+                        model,
+                        dev,
+                        collator,
+                        run / f"dev-step-{step:06d}.jsonl",
+                        config["eval_batch_size"],
+                    )
+                    metrics = by_dataset(predictions)
+                    score = metrics["macro_accuracy"]
+                    emit(run / "metrics.jsonl", {"kind": "dev", "step": step, "metrics": metrics})
+                    if score > best:
+                        best = score
+                        save_checkpoint(run / "best.pt", model, optimizer, step, frozen, best)
+                    save_checkpoint(run / "last.pt", model, optimizer, step, frozen, best)
+                if is_distributed:
+                    torch.distributed.barrier()
             elif step % config["save_every"] == 0:
-                save_checkpoint(run / "last.pt", model, optimizer, step, frozen, best)
-    emit(
-        run / "metrics.jsonl",
-        {
-            "kind": "train_complete",
-            "step": step,
-            "best_dev_macro_accuracy": best,
-            "telemetry": telemetry.summary(),
-            "consumed": dict(consumed),
-        },
-    )
+                if rank == 0:
+                    save_checkpoint(run / "last.pt", model, optimizer, step, frozen, best)
+                if is_distributed:
+                    torch.distributed.barrier()
+    if rank == 0:
+        emit(
+            run / "metrics.jsonl",
+            {
+                "kind": "train_complete",
+                "step": step,
+                "best_dev_macro_accuracy": best,
+                "telemetry": telemetry.summary(),
+                "consumed": {k: v * world_size for k, v in consumed.items()},
+            },
+        )
+    if is_distributed:
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
 
 
 def final_evaluation(config, run, *, adapter=None):

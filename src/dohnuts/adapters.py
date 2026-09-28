@@ -33,9 +33,13 @@ class Qwen35Adapter:
 
         # The desktop shares this GPU. Bound the caching allocator so a sequence
         # of evaluation shapes cannot retain nearly all VRAM and crash the compositor.
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
         if torch.cuda.is_available():
-            torch.cuda.set_per_process_memory_fraction(0.8)
+            torch.cuda.set_per_process_memory_fraction(0.8, device=device)
             if torch.version.hip:
                 os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
             enable_triton_convolution()
