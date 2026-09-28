@@ -16,7 +16,16 @@ BASE_MODEL = Path(".cache/models/Qwen3.5-0.8B")
 DATA = Path("data/processed/v1")
 
 
-def training_recipe(*, model=BASE_MODEL, data=DATA, seed=42, rlcd=None, steps=TRAINING_STEPS):
+def training_recipe(
+    *,
+    model=BASE_MODEL,
+    data=DATA,
+    seed=42,
+    rlcd=None,
+    steps=TRAINING_STEPS,
+    batch_size=8,
+    accumulation=4,
+):
     if not isinstance(steps, int) or steps < 1:
         raise ValueError("Training steps must be a positive integer")
     policy = rlcd or RLCDConfig()
@@ -25,8 +34,8 @@ def training_recipe(*, model=BASE_MODEL, data=DATA, seed=42, rlcd=None, steps=TR
         "data": str(data),
         "seed": seed,
         "lora_rank": 8,
-        "batch_size": 8,
-        "accumulation": 4,
+        "batch_size": batch_size,
+        "accumulation": accumulation,
         "steps": steps,
         "backbone_lr": 1e-4,
         "head_lr": 5e-4,

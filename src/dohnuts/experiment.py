@@ -109,15 +109,26 @@ def latency_stats(durations: list[float], batch: int):
 def timed(operation, repeats: int):
     durations = []
     for _ in range(repeats):
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         start = time.perf_counter()
         operation()
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         durations.append((time.perf_counter() - start) * 1000)
     return durations
 
 
 def memory():
+    if not torch.cuda.is_available():
+        return {
+            "allocated_gib": 0.0,
+            "reserved_gib": 0.0,
+            "peak_allocated_gib": 0.0,
+            "peak_reserved_gib": 0.0,
+            "device_free_gib": 0.0,
+            "device_total_gib": 0.0,
+        }
     free, total = torch.cuda.mem_get_info()
     return {
         "allocated_gib": torch.cuda.memory_allocated() / GIB,
@@ -129,6 +140,13 @@ def memory():
     }
 
 
+def safe_version(name: str):
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
 def environment(model: DecisionModel, checkpoint: Path):
     from transformers.models.qwen3_5 import modeling_qwen3_5 as implementation
 
@@ -137,7 +155,7 @@ def environment(model: DecisionModel, checkpoint: Path):
         "platform": platform.platform(),
         "python": platform.python_version(),
         "versions": {
-            name: importlib.metadata.version(name)
+            name: safe_version(name)
             for name in [
                 "torch",
                 "torchvision",
@@ -149,8 +167,8 @@ def environment(model: DecisionModel, checkpoint: Path):
             ]
         },
         "hip": torch.version.hip,
-        "gpu": torch.cuda.get_device_name(),
-        "gpu_properties": str(torch.cuda.get_device_properties(0)),
+        "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "CPU",
+        "gpu_properties": str(torch.cuda.get_device_properties(0)) if torch.cuda.is_available() else "None",
         "checkpoint_revision": model_revision(checkpoint),
         "parameters": sum(p.numel() for p in model.parameters()),
         "head_parameters": sum(p.numel() for p in model.head.parameters()),
@@ -159,7 +177,7 @@ def environment(model: DecisionModel, checkpoint: Path):
         "kernel_flags": {
             "linear_patch": True,
             "triton_convolution": bool(torch.version.hip),
-            "fused_norm_and_swiglu": True,
+            "fused_norm_and_swiglu": torch.cuda.is_available(),
             "shared_prefix": True,
             "frozen_vision_cache_MiB": 128,
             "experimental_rocm_sdpa": os.environ.get("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"),

@@ -42,7 +42,7 @@ def save_checkpoint(path, model, optimizer, step, config, score):
         "trainable": {n: p.detach().cpu() for n, p in model.named_parameters() if p.requires_grad},
         "optimizer": optimizer.state_dict(),
         "torch_rng": torch.get_rng_state(),
-        "cuda_rng": torch.cuda.get_rng_state_all(),
+        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         "python_rng": random.getstate(),
     }
     temporary = path.with_suffix(".tmp")
@@ -62,7 +62,8 @@ def load_checkpoint(model, path, optimizer=None):
     if optimizer is not None:
         optimizer.load_state_dict(state["optimizer"])
         torch.set_rng_state(state["torch_rng"])
-        torch.cuda.set_rng_state_all(state["cuda_rng"])
+        if torch.cuda.is_available() and state.get("cuda_rng") is not None:
+            torch.cuda.set_rng_state_all(state["cuda_rng"])
         random.setstate(state["python_rng"])
     return state
 
@@ -86,7 +87,8 @@ def evaluate(model, groups, collator, output, batch_size=16):
         def collect():
             ready, logits, rows = pending.popleft()
             # D2H is asynchronous: CPU must not inspect pinned results before this event.
-            ready.synchronize()
+            if ready is not None:
+                ready.synchronize()
             for i, row in enumerate(rows):
                 result = {k: row[k] for k in ["id", "dataset", "group", "target"]}
                 result.update(
@@ -108,13 +110,17 @@ def evaluate(model, groups, collator, output, batch_size=16):
 
         for (inputs, positions, _, _, _), rows in prefetch_batches(loader):
             logits = model(inputs, positions)
-            host = torch.empty_like(logits, device="cpu", pin_memory=True)
-            host.copy_(logits, non_blocking=True)
-            ready = torch.cuda.Event()
-            ready.record()
-            pending.append((ready, host, rows))
-            # Submit the following forward before serializing the preceding results.
-            if len(pending) == 2:
+            if torch.cuda.is_available():
+                host = torch.empty_like(logits, device="cpu", pin_memory=True)
+                host.copy_(logits, non_blocking=True)
+                ready = torch.cuda.Event()
+                ready.record()
+                pending.append((ready, host, rows))
+                if len(pending) == 2:
+                    collect()
+            else:
+                host = logits.cpu()
+                pending.append((None, host, rows))
                 collect()
         while pending:
             collect()
@@ -285,7 +291,7 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
             for group in optimizer.param_groups:
                 group["lr"] = group["initial_lr"] * factor
             stats = Counter()
-            finite = torch.ones((), dtype=torch.bool, device="cuda")
+            finite = torch.ones((), dtype=torch.bool, device="cuda" if torch.cuda.is_available() else "cpu")
             step_start = time.perf_counter()
             for _micro in range(config["accumulation"]):
                 batch, key, ids = next(iterator)
@@ -306,7 +312,8 @@ def train(config, run, *, resume=False, adapter=None, initialize_from=None):
             optimizer.step()
             step += 1
             if step == 1 or step % config["log_every"] == 0:
-                torch.cuda.synchronize()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 # Counter's stub assumes int values; these accumulators contain tensors.
                 totals = cast(list[torch.Tensor], list(stats.values()))
                 emit(
@@ -483,6 +490,8 @@ def main():
         seed=config["seed"],
         rlcd=RLCDConfig(**config.get("rlcd", {})),
         steps=config["steps"],
+        batch_size=config.get("batch_size", 8),
+        accumulation=config.get("accumulation", 4),
     )
     if config != expected:
         raise ValueError("Training uses the fixed recipe, RLCD controls, and step budget")

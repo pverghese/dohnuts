@@ -165,11 +165,12 @@ class Predictor:
         inputs, positions, mask, metadata = self.prepare(state, questions)
         token_count = int(inputs["attention_mask"].sum())
         has_image = "pixel_values" in inputs
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         inputs = {
-            key: value.to("cuda") if isinstance(value, torch.Tensor) else value
+            key: value.to(device) if isinstance(value, torch.Tensor) else value
             for key, value in inputs.items()
         }
-        positions = positions.to("cuda")
+        positions = positions.to(device)
         logits = self.model(inputs, positions).cpu().masked_fill(~mask, -torch.inf)
         answers = {}
         for row, (qid, kind, labels) in enumerate(metadata):

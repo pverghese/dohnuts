@@ -33,17 +33,21 @@ class Qwen35Adapter:
 
         # The desktop shares this GPU. Bound the caching allocator so a sequence
         # of evaluation shapes cannot retain nearly all VRAM and crash the compositor.
-        torch.cuda.set_per_process_memory_fraction(0.8)
-        if torch.version.hip:
-            os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
-            enable_triton_convolution()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            torch.cuda.set_per_process_memory_fraction(0.8)
+            if torch.version.hip:
+                os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+                enable_triton_convolution()
+        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         backbone = AutoModel.from_pretrained(
-            checkpoint, dtype=torch.bfloat16, attn_implementation="sdpa", local_files_only=True
-        ).to("cuda")
+            checkpoint, dtype=dtype, attn_implementation="sdpa", local_files_only=True
+        ).to(device)
         backbone.requires_grad_(False)
         backbone.config.use_cache = False
         enable_linear_patch_embedding(backbone.visual)
-        enable_fusion(backbone)
+        if torch.cuda.is_available():
+            enable_fusion(backbone)
         backbone._dohnuts_image_cache = OrderedDict()
         return backbone
 

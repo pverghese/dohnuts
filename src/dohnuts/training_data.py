@@ -85,14 +85,16 @@ class DecisionCollator:
 
 
 def to_gpu(batch):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    non_blocking = torch.cuda.is_available()
     inputs, positions, mask, target, ordinal = batch
     inputs = {
-        k: v.to("cuda", dtype=torch.bfloat16 if k == "pixel_values" else v.dtype, non_blocking=True)
+        k: v.to(device, dtype=torch.bfloat16 if (k == "pixel_values" and torch.cuda.is_available()) else v.dtype, non_blocking=non_blocking)
         if isinstance(v, torch.Tensor)
         else v
         for k, v in inputs.items()
     }
-    return inputs, *(v.to("cuda", non_blocking=True) for v in (positions, mask, target, ordinal))
+    return inputs, *(v.to(device, non_blocking=non_blocking) for v in (positions, mask, target, ordinal))
 
 
 def prefetch_batches(loader):
@@ -102,6 +104,12 @@ def prefetch_batches(loader):
     consumer wait only for its own batch, not the following transfer. Recording
     the consumer stream keeps transferred storage alive through asynchronous use.
     """
+    if not torch.cuda.is_available():
+        for item in loader:
+            batch, *metadata = item
+            yield to_gpu(batch), *metadata
+        return
+
     iterator = iter(loader)
     transfer = torch.cuda.Stream()
 
